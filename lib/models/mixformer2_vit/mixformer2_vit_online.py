@@ -63,32 +63,64 @@ class Attention(nn.Module):
 
         self.qkv_mem = None
 
-    def forward(self, x, t_h, t_w, s_h, s_w):
+    def forward(self, x, t_h, t_w, s_h, s_w, last4=False):
+        # 对于第4个transformer block， 可以进行剪枝， @ last4 标志是否是最后一个transformer block
         """
         x is a concatenated vector of template and search region features.
         """
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
+        
+        if not last4:
+            qkv = self.qkv(x).reshape(B, N, 3, C)  
+            q, k, v = torch.split(qkv, 1, dim=2)
+            q = q.reshape(B, N, C)
+            k = k.reshape(B, N, C)
+            v = v.reshape(B, N, C)
+            
+            q_mt, q_s = torch.split(q, [t_h * t_w * 2, s_h * s_w + 4], dim=1)
+            k_mt, k_s = torch.split(k, [t_h * t_w * 2, s_h * s_w + 4], dim=1)
+            v_mt, v_s = torch.split(v, [t_h * t_w * 2, s_h * s_w + 4], dim=1)
+            
+            q_mt = q_mt.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            k_mt = k_mt.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            v_mt = v_mt.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            q_s = q_s.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            k = k.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            v = v.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+                
+            # asymmetric mixed attention
+            attn = (q_mt @ k_mt.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x_mt = (attn @ v_mt).transpose(1, 2).reshape(B, t_h * t_w * 2, C)
 
-        q_mt, q_s = torch.split(q, [t_h * t_w * 2, s_h * s_w + 4], dim=2)
-        k_mt, k_s = torch.split(k, [t_h * t_w * 2, s_h * s_w + 4], dim=2)
-        v_mt, v_s = torch.split(v, [t_h * t_w * 2, s_h * s_w + 4], dim=2)
+            attn = (q_s @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x_s = (attn @ v).transpose(1, 2).reshape(B, s_h * s_w + 4, C)
 
-        # asymmetric mixed attention
-        attn = (q_mt @ k_mt.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x_mt = (attn @ v_mt).transpose(1, 2).reshape(B, t_h * t_w * 2, C)
+            x = torch.cat([x_mt, x_s], dim=1)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+        else:
+            
+            weight = self.qkv.weight.data.reshape(3, C, C).permute(0, 2, 1)
+            bias = self.qkv.bias.data.reshape(3, C)
+            q = x[:, -4:, :] @ weight[0] + bias[0].reshape(C)
+            k = x @ weight[1] + bias[1].reshape(C)
+            v = x @ weight[2] + bias[2].reshape(C)
+            
+            q = q.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            k = k.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            v = v.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, 4, C)
 
-        attn = (q_s @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x_s = (attn @ v).transpose(1, 2).reshape(B, s_h * s_w + 4, C)
-
-        x = torch.cat([x_mt, x_s], dim=1)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            
         return x
 
     def forward_test(self, x, s_h, s_w):
@@ -148,6 +180,12 @@ class Block(nn.Module):
 
     def forward(self, x, t_h, t_w, s_h, s_w):
         x = x + self.drop_path1(self.attn(self.norm1(x), t_h, t_w, s_h, s_w))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
+    
+    # 最后一个 transformer block 可以进行剪枝优化
+    def forward_last(self, x, t_h, t_w, s_h, s_w):
+        x = x[:,-4:,:] + self.drop_path1(self.attn(self.norm1(x), t_h, t_w, s_h, s_w, last4=True))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
 
@@ -233,16 +271,15 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         distill_feat_list = []
 
         for i, blk in enumerate(self.blocks):
-            x = blk(x, H_t, W_t, H_s, W_s)
+            if i < 3:
+                x = blk(x, H_t, W_t, H_s, W_s)
+            else:
+                x = blk.forward_last(x, H_t, W_t, H_s, W_s)
             distill_feat_list.append(x)
 
-        x_t, x_ot, x_s, reg_tokens = torch.split(x, [H_t*W_t, H_t*W_t, H_s*W_s, 4], dim=1)
-
-        x_t_2d = x_t.transpose(1, 2).reshape(B, C, H_t, W_t)
-        x_ot_2d = x_ot.transpose(1, 2).reshape(B, C, H_t, W_t)
-        x_s_2d = x_s.transpose(1, 2).reshape(B, C, H_s, W_s)
-
-        return x_t_2d, x_ot_2d, x_s_2d, reg_tokens, distill_feat_list
+        reg_tokens = x
+        
+        return None, None, None, reg_tokens, None
 
     def forward_test(self, x):
         x = self.patch_embed(x)
@@ -314,7 +351,43 @@ class MixFormer(nn.Module):
         self.head_type = head_type
         self.score_head = score_head
 
+    
     def forward(self, template, online_template, search, softmax, run_score_head=True, gt_bboxes=None):
+
+        data = torch.load('test_in.pt')
+        data_ref = torch.load("test_ref.pt")
+
+        pred_boxes, pred_scores = self.forward_real(data['img_t'], data['img_ot'], data['img_search'])      
+        assert torch.allclose(data_ref['pred_boxes'], pred_boxes)
+        
+        # exit(0)
+        class Model(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+            def forward(self, img_t, img_ot, img_search):
+                pred_boxes, pred_scores = self.model.forward_real(img_t, img_ot, img_search)
+                return pred_boxes, pred_scores
+
+        dummy_input = (data['img_t'], data['img_ot'], data['img_search'])
+        model = Model(self)
+        torch.onnx.export(
+            model,
+            dummy_input,
+            "model.onnx",
+            opset_version=12,
+            input_names=['img_t', 'img_ot', 'img_search'],
+            output_names=['pred_boxes', 'pred_scores'],
+            verbose=True
+        )
+
+        print("=========[finished] ONNX model exported ===========.")
+        exit(0)
+    
+    def forward_real(self, template, online_template, search, softmax=True, run_score_head=True, gt_bboxes=None):
+
+        # torch.save({'img_search':search, 'img_t':template, 'img_ot':online_template}, 'test_in.pt')
+
         # search: (b, c, h, w)
         if template.dim() == 5:
             template = template.squeeze(0)
@@ -328,7 +401,8 @@ class MixFormer(nn.Module):
         out['reg_tokens'] = reg_tokens
         out['distill_feat_list'] = distill_feat_list
 
-        return out
+        # torch.save({'pred_boxes':out['pred_boxes']}, 'test_ref.pt')
+        return out['pred_boxes'], out['pred_scores']
 
     def forward_test(self, search, softmax, run_score_head=True, gt_bboxes=None):
         # search: (b, c, h, w)
@@ -369,10 +443,15 @@ class MixFormer(nn.Module):
         :return:
         """
         if "MLP" in self.head_type:
-            b = reg_tokens.size(0)
+            batch = reg_tokens.size(0)
             pred_boxes, prob_l, prob_t, prob_r, prob_b = self.box_head(reg_tokens, softmax=softmax)
-            outputs_coord = box_xyxy_to_cxcywh(pred_boxes)
-            outputs_coord_new = outputs_coord.view(b, 1, 4)
+            x0, x1, y0, y1 = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]            
+            b = [(x0 + x1) / 2, (y0 + y1) / 2,
+                (x1 - x0), (y1 - y0)]
+            outputs_coord =  torch.stack(b, dim=-1)
+            
+            
+            outputs_coord_new = outputs_coord.view(batch, 1, 4)
             out = {
                 'pred_boxes': outputs_coord_new,
                 'prob_l': prob_l,

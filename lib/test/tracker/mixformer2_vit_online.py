@@ -14,10 +14,10 @@ class MixFormerOnline(BaseTracker):
     def __init__(self, params, dataset_name):
         super(MixFormerOnline, self).__init__(params)
         network = build_mixformer2_vit_online(params.cfg,  train=False)
-        network.load_state_dict(torch.load(self.params.checkpoint, map_location='cpu')['net'], strict=True)
+        network.load_state_dict(torch.load("./ckpts/mixformerv2_small.pth.tar", map_location='cpu')['net'], strict=True)
         print(f"Load checkpoint {self.params.checkpoint} successfully!")
         self.cfg = params.cfg
-        self.network = network.cuda()
+        self.network = network
         self.network.eval()
         self.attn_weights = []
 

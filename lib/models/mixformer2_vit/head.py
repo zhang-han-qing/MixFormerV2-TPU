@@ -23,31 +23,24 @@ class MlpHead(nn.Module):
                                           for i, (n, k) in enumerate(zip([in_dim] + h, h + [out_dim]))])
  
         with torch.no_grad():
-            self.indice = torch.arange(0, feat_sz).unsqueeze(0).cuda() * stride # (1, feat_sz)
+            self.indice = torch.arange(0, feat_sz).unsqueeze(0) * stride # (1, feat_sz)
 
     def forward(self, reg_tokens, softmax):
         """
         reg_tokens shape: (b, 4, embed_dim)
         """
-        reg_token_l, reg_token_r, reg_token_t, reg_token_b = reg_tokens.unbind(dim=1)   # (b, c)
-        score_l = self.layers(reg_token_l)
-        score_r = self.layers(reg_token_r)
-        score_t = self.layers(reg_token_t)
-        score_b = self.layers(reg_token_b) # (b, feat_sz)
-
-        prob_l = score_l.softmax(dim=-1)
-        prob_r = score_r.softmax(dim=-1)
-        prob_t = score_t.softmax(dim=-1)
-        prob_b = score_b.softmax(dim=-1)
+        
+        score = self.layers(reg_tokens)
+        prob = score.softmax(dim=-1)
+        coord = torch.sum((self.indice * prob), dim=-1)
+        
+        coord_l, coord_r, coord_t, coord_b = coord.unbind(dim=1)
+        prob_l, prob_r, prob_t, prob_b = prob.unbind(dim=1)
+        score_l, score_r, score_t, score_b = score.unbind(dim=1)
     
-        coord_l = torch.sum((self.indice * prob_l), dim=-1)
-        coord_r = torch.sum((self.indice * prob_r), dim=-1)
-        coord_t = torch.sum((self.indice * prob_t), dim=-1)
-        coord_b = torch.sum((self.indice * prob_b), dim=-1) # (b, ) absolute coordinates
-
         # return xyxy, ltrb
         if softmax:
-            return torch.stack((coord_l, coord_t, coord_r, coord_b), dim=1) / self.img_sz, \
+            return coord / self.img_sz, \
                 prob_l, prob_t, prob_r, prob_b
         else:
             return torch.stack((coord_l, coord_t, coord_r, coord_b), dim=1) / self.img_sz, \

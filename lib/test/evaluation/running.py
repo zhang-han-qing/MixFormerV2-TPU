@@ -105,8 +105,8 @@ def run_sequence(seq: Sequence, tracker: Tracker, debug=False, num_gpu=8):
     try:
         worker_name = multiprocessing.current_process().name
         worker_id = int(worker_name[worker_name.find('-') + 1:]) - 1
-        gpu_id = worker_id % num_gpu
-        torch.cuda.set_device(gpu_id)
+        # gpu_id = worker_id % num_gpu
+        # torch.cuda.set_device(gpu_id)
     except:
         pass
 
